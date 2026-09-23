@@ -64,19 +64,18 @@ install separately: no Python, no Terminal, and no config files.
 
 ---
 
-## Connecting a model provider
+## What you need
 
-MicroBenchmark needs access to one AI model to analyze your history and draft
-benchmarks. **Any one of these is enough:**
+MicroBenchmark runs on the AI coding tool you already use. You need **one** of
+these installed and signed in:
 
-- **Claude Code** (if it's installed, the app uses your existing subscription)
-- **Codex CLI** (uses your existing ChatGPT/Codex subscription)
-- An **Anthropic**, **OpenAI**, or **Gemini** API key
+- **Claude Code**, which uses your existing Claude subscription
+- **Codex CLI**, which uses your existing ChatGPT/Codex subscription
 
-Open **Settings** in the app to add API keys and choose which provider to try
-first. The app shows which providers it has detected. Installed CLIs come
-first by default because they don't cost anything beyond a subscription you
-already pay for.
+You don't need API keys, and there are no extra usage charges beyond the
+subscription you already pay for. If you have both installed, the app
+automatically uses the one you work in more. In **Settings** you can pick which
+model each tool runs on.
 
 ---
 
@@ -86,9 +85,11 @@ Your history stays on your machine unless you choose to send it.
 
 - **Scanning is local.** Finding candidate tasks happens entirely on your
   computer, with no network requests and no model calls.
-- **You approve before anything is sent.** Before analysis, the app tells you
-  exactly what will go to your chosen provider: only the visible conversation
-  text for the work you selected.
+- **You decide what gets analyzed.** Analysis sends only the visible
+  conversation text of your sessions, and it goes through your own Claude Code
+  or Codex account. The app asks for your consent before analyzing anything,
+  and you can turn off automatic analysis of new work at any time in
+  **Settings**.
 - **Hidden content is never sent.** Tool calls, tool outputs, hidden reasoning,
   system messages, and subagent activity are excluded.
 - **Raw session files are never copied.** Your Claude Code and Codex logs stay
