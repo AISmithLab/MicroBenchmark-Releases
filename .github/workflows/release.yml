@@ -1,0 +1,488 @@
+name: Desktop release
+
+# Runs from the public AISmithLab/MicroBenchmark-Releases repo, checks out the
+# private MicroBenchmark source at the requested tag, and publishes the macOS
+# and Windows installers plus one shared latest.json to its own Releases page.
+# The reviewed source of truth for this workflow is release/release.yml in the
+# private repo; verify-source rejects a public copy that matches neither the
+# source tag's copy nor the private main branch's copy.
+#
+# This repo is public, so anyone can read these run logs. Steps that print
+# private source (dependency install, staging, frontend and Rust builds, whose
+# diagnostics quote source lines) run through the quiet helper: their output
+# is captured, never printed, and kept only as an encrypted artifact on
+# failure (see apps/desktop/RELEASING.md for how to read it).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g. 1.2.3 or 1.2.3-rc.1)"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark the created release as a prerelease (invisible to /releases/latest). Clear it only for a real release: a stable release goes live to every installed app."
+        type: boolean
+        default: true
+
+# Read-only by default; only the jobs that create or publish the release get
+# write access, and none of them installs dependencies or runs a build.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - name: Resolve release version and tag
+        id: version
+        env:
+          # Passed through env, never pasted into the script: a dispatch input
+          # interpolated into `run:` is executed as shell.
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          VERSION="$INPUT_VERSION"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$ ]]; then
+            echo "::error::version must look like 1.2.3 or 1.2.3-rc.1, without a leading v"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+          # A version with a prerelease identifier is always a prerelease,
+          # even if the dispatch checkbox was cleared.
+          if [ "$INPUT_PRERELEASE" = "true" ]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$VERSION" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  verify-source:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out private source tag
+        uses: actions/checkout@v7
+        with:
+          repository: AISmithLab/MicroBenchmark
+          ref: refs/tags/${{ needs.version.outputs.tag }}
+          ssh-key: ${{ secrets.SOURCE_REPO_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Check out reviewed workflow on private main
+        uses: actions/checkout@v7
+        with:
+          repository: AISmithLab/MicroBenchmark
+          ref: main
+          path: _source_main
+          sparse-checkout: release/release.yml
+          sparse-checkout-cone-mode: false
+          ssh-key: ${{ secrets.SOURCE_REPO_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Check out public release workflow
+        uses: actions/checkout@v7
+        with:
+          path: _releases
+          sparse-checkout: .github/workflows/release.yml
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Verify public workflow matches reviewed source
+        run: |
+          PUBLIC=_releases/.github/workflows/release.yml
+          # The tag's own copy covers a release cut together with its workflow.
+          # Private main's copy covers rebuilding an older tag, or one cut
+          # before a later workflow fix, with the current reviewed workflow.
+          if cmp -s release/release.yml "$PUBLIC"; then
+            echo "public workflow matches release/release.yml at the source tag"
+          elif cmp -s _source_main/release/release.yml "$PUBLIC"; then
+            echo "public workflow matches release/release.yml on private main"
+          else
+            diff -u _source_main/release/release.yml "$PUBLIC" || true
+            echo "::error::public release workflow matches neither release/release.yml at the source tag nor on private main; copy it byte-for-byte from private main"
+            exit 1
+          fi
+
+      - name: Verify app version files
+        if: needs.version.outputs.prerelease != 'true'
+        env:
+          EXPECTED: ${{ needs.version.outputs.version }}
+        run: |
+          # package.json is the source of truth, but tauri.conf.json and
+          # Cargo.toml set the version compiled into the app. If any lags,
+          # latest.json would advertise a version the shipped app never reports.
+          node - <<'JS'
+          const fs = require('fs');
+          const expected = process.env.EXPECTED;
+          const cargo = fs.readFileSync('apps/desktop/src-tauri/Cargo.toml', 'utf8');
+          const found = {
+            'package.json': JSON.parse(fs.readFileSync('package.json', 'utf8')).version,
+            'apps/desktop/src-tauri/tauri.conf.json':
+              JSON.parse(fs.readFileSync('apps/desktop/src-tauri/tauri.conf.json', 'utf8')).version,
+            'apps/desktop/src-tauri/Cargo.toml': (cargo.match(/^version\s*=\s*"([^"]*)"/m) || [])[1],
+          };
+          const wrong = Object.entries(found).filter(([, v]) => v !== expected);
+          for (const [file, v] of wrong) {
+            console.log(`::error::${file} version ${v} does not match requested release ${expected}; run npm run release:prepare and re-tag`);
+          }
+          process.exit(wrong.length ? 1 : 0);
+          JS
+
+  create-release:
+    needs: [version, verify-source]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create draft release on the releases repo
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+          PRERELEASE: ${{ needs.version.outputs.prerelease }}
+        run: |
+          PRERELEASE_FLAG=""
+          if [ "$PRERELEASE" = "true" ]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $TAG already exists on $GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft $PRERELEASE_FLAG \
+              --title "$TAG" --notes "Building…"
+          fi
+
+  build:
+    needs: [version, create-release]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS gates its window-control redesign on the SDK the binary was
+          # linked against, not the OS it runs on, so a release built against
+          # an older SDK keeps drawing the pre-26 traffic lights even on macOS
+          # 26. Nothing here selects an Xcode, so the runner image is what
+          # picks the SDK: macos-26 defaults to Xcode 26 (SDK 26.x). The
+          # deployment floor is unaffected -- it comes from
+          # tauri.macos.conf.json's minimumSystemVersion, not from the SDK.
+          - os: macos-26
+            platform_key: darwin-aarch64
+          - os: windows-latest
+            platform_key: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    # No write access: this job runs npm ci and third-party actions. Installers
+    # leave as workflow artifacts, and publish attaches them to the release.
+    permissions:
+      contents: read
+    env:
+      RELEASE_LOG_PASSPHRASE: ${{ secrets.RELEASE_LOG_PASSPHRASE }}
+    steps:
+      - name: Check out private source tag
+        uses: actions/checkout@v7
+        with:
+          repository: AISmithLab/MicroBenchmark
+          ref: refs/tags/${{ needs.version.outputs.tag }}
+          ssh-key: ${{ secrets.SOURCE_REPO_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop/src-tauri
+
+      # Written into $RUNNER_TEMP rather than committed, so this workflow can
+      # still build a source tag from before the helper existed.
+      - name: Install quiet helper
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/release-logs"
+          cat > "$RUNNER_TEMP/encrypt-log.js" <<'JS'
+          // Usage: node encrypt-log.js <in> <out>. AES-256-GCM with a key
+          // scrypt-derived from RELEASE_LOG_PASSPHRASE. Read it back with
+          // scripts/decrypt-release-log.js.
+          const crypto = require('crypto');
+          const fs = require('fs');
+          const [input, output] = process.argv.slice(2);
+          const salt = crypto.randomBytes(16);
+          const iv = crypto.randomBytes(12);
+          const key = crypto.scryptSync(process.env.RELEASE_LOG_PASSPHRASE, salt, 32);
+          const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+          const body = Buffer.concat([cipher.update(fs.readFileSync(input)), cipher.final()]);
+          fs.writeFileSync(output, Buffer.concat([Buffer.from('MBLOG1'), salt, iv, cipher.getAuthTag(), body]));
+          JS
+          cat > "$RUNNER_TEMP/quiet.sh" <<'SH'
+          # quiet <name> <command...>: run a command without printing its
+          # output. On failure, keep an encrypted copy for the release-logs
+          # artifact and return the command's exit status.
+          quiet() {
+            local name="$1"
+            shift
+            local log="$RUNNER_TEMP/release-logs/$name.log"
+            local status=0
+            "$@" >"$log" 2>&1 || status=$?
+            if [ "$status" -eq 0 ]; then
+              rm -f "$log"
+              echo "$name: ok (output hidden: this repo's logs are public)"
+              return 0
+            fi
+            if [ -n "${RELEASE_LOG_PASSPHRASE:-}" ]; then
+              node "$RUNNER_TEMP/encrypt-log.js" "$log" "$log.enc"
+              echo "::error::$name failed (exit $status). Output is hidden because this repo's logs are public; download the release-logs artifact and read it with scripts/decrypt-release-log.js."
+            else
+              echo "::error::$name failed (exit $status). Output is hidden because this repo's logs are public, and RELEASE_LOG_PASSPHRASE is not set, so no encrypted copy was kept."
+            fi
+            rm -f "$log"
+            return "$status"
+          }
+          SH
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          . "$RUNNER_TEMP/quiet.sh"
+          quiet npm-ci npm ci
+
+      - name: Stage build-time resources (portable Python + scoped backend)
+        shell: bash
+        run: |
+          . "$RUNNER_TEMP/quiet.sh"
+          quiet stage-python-runtime bash scripts/stage-python-runtime.sh
+          quiet stage-desktop-backend node scripts/stage-desktop-backend.js
+
+      - name: Import Apple Developer ID certificate
+        if: matrix.platform_key == 'darwin-aarch64'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          CERTIFICATE_PATH="$RUNNER_TEMP/apple-developer-id.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/microbenchmark-signing.keychain-db"
+
+          if [ -z "${APPLE_CERTIFICATE:-}" ] || [ -z "${APPLE_CERTIFICATE_PASSWORD:-}" ] || [ -z "${APPLE_SIGNING_IDENTITY:-}" ] || [ -z "${KEYCHAIN_PASSWORD:-}" ]; then
+            echo "::error::missing one or more Apple signing secrets: APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY, KEYCHAIN_PASSWORD"
+            exit 1
+          fi
+
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$CERTIFICATE_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security default-keychain -s "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -t 3600 -u "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep -F "$APPLE_SIGNING_IDENTITY"
+          echo "APPLE_KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+
+      - name: Prepare App Store Connect API key
+        if: matrix.platform_key == 'darwin-aarch64'
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_PRIVATE_KEY_BASE64: ${{ secrets.APPLE_API_KEY_PRIVATE_KEY_BASE64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${APPLE_API_KEY:-}" ] || [ -z "${APPLE_API_KEY_PRIVATE_KEY_BASE64:-}" ]; then
+            echo "::error::missing App Store Connect API key secrets: APPLE_API_KEY, APPLE_API_KEY_PRIVATE_KEY_BASE64"
+            exit 1
+          fi
+          API_KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+          echo "$APPLE_API_KEY_PRIVATE_KEY_BASE64" | base64 --decode > "$API_KEY_PATH"
+          chmod 600 "$API_KEY_PATH"
+          echo "APPLE_API_KEY_PATH=$API_KEY_PATH" >> "$GITHUB_ENV"
+
+      - name: Sign staged macOS native resources
+        if: matrix.platform_key == 'darwin-aarch64'
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        shell: bash
+        run: |
+          . "$RUNNER_TEMP/quiet.sh"
+          quiet sign-native-resources scripts/sign-macos-native-resources.sh
+
+      - name: Build macOS desktop app
+        if: matrix.platform_key == 'darwin-aarch64'
+        env:
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          . "$RUNNER_TEMP/quiet.sh"
+          quiet tauri-build npm exec tauri build
+
+      - name: Build Windows desktop app
+        if: matrix.platform_key == 'windows-x86_64'
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          . "$RUNNER_TEMP/quiet.sh"
+          quiet tauri-build npm exec tauri build
+
+      - name: Clean up Apple signing keychain
+        if: always() && matrix.platform_key == 'darwin-aarch64'
+        shell: bash
+        run: |
+          if [ -n "${APPLE_KEYCHAIN_PATH:-}" ] && [ -e "$APPLE_KEYCHAIN_PATH" ]; then
+            security delete-keychain "$APPLE_KEYCHAIN_PATH"
+          fi
+
+      - name: Collect macOS installers
+        if: matrix.platform_key == 'darwin-aarch64'
+        shell: bash
+        run: |
+          BUNDLE_DIR="apps/desktop/src-tauri/target/release/bundle"
+          DMG=$(find "$BUNDLE_DIR/dmg" -name '*.dmg' | head -1)
+          APP_TAR=$(find "$BUNDLE_DIR/macos" -name '*.app.tar.gz' | head -1)
+          APP_SIG=$(find "$BUNDLE_DIR/macos" -name '*.app.tar.gz.sig' | head -1)
+          if [ -z "$DMG" ] || [ -z "$APP_TAR" ] || [ -z "$APP_SIG" ]; then
+            echo "::error::missing expected macOS bundle artifact(s) under $BUNDLE_DIR"
+            find "$BUNDLE_DIR" -maxdepth 2
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/installers"
+          cp "$DMG" "$APP_TAR" "$APP_SIG" "$RUNNER_TEMP/installers/"
+
+      - name: Collect Windows installers
+        if: matrix.platform_key == 'windows-x86_64'
+        shell: bash
+        run: |
+          BUNDLE_DIR="apps/desktop/src-tauri/target/release/bundle"
+          # createUpdaterArtifacts signs the NSIS installer .exe itself on
+          # Windows (unlike macOS's separate .app.tar.gz) -- there is no
+          # .nsis.zip.
+          INSTALLER=$(find "$BUNDLE_DIR/nsis" -name '*-setup.exe' | head -1)
+          INSTALLER_SIG=$(find "$BUNDLE_DIR/nsis" -name '*-setup.exe.sig' | head -1)
+          if [ -z "$INSTALLER" ] || [ -z "$INSTALLER_SIG" ]; then
+            echo "::error::missing expected Windows bundle artifact(s) under $BUNDLE_DIR"
+            find "$BUNDLE_DIR" -maxdepth 2
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/installers"
+          cp "$INSTALLER" "$INSTALLER_SIG" "$RUNNER_TEMP/installers/"
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v7
+        with:
+          name: installers-${{ matrix.platform_key }}
+          path: ${{ runner.temp }}/installers/
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+
+      - name: Upload encrypted build logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-logs-${{ matrix.platform_key }}
+          path: ${{ runner.temp }}/release-logs/*.enc
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 14
+
+  publish:
+    needs: [version, build]
+    # Runs even if one matrix leg of `build` failed, so a broken/flaky
+    # Windows runner can't block publishing macOS's already-uploaded
+    # artifacts (see generate-latest-json.js, which degrades to whichever
+    # platforms actually have complete assets). Still requires `version` to
+    # have succeeded, and skips entirely if `build` itself never ran
+    # (skipped/cancelled -- e.g. create-release failed), since there would be
+    # nothing on the release to publish.
+    if: |
+      always() && needs.version.result == 'success' &&
+      needs.build.result != 'skipped' && needs.build.result != 'cancelled'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # Reads this run's installer artifacts.
+      actions: read
+    steps:
+      - name: Check out private source tag
+        uses: actions/checkout@v7
+        with:
+          repository: AISmithLab/MicroBenchmark
+          ref: refs/tags/${{ needs.version.outputs.tag }}
+          ssh-key: ${{ secrets.SOURCE_REPO_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Attach installers to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          # A failed build leg uploads no artifact. Attach whatever did build;
+          # generate-latest-json.js reports the rest as missing, and fails if
+          # nothing built at all.
+          if ! gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'installers-*' --dir "$RUNNER_TEMP/installers"; then
+            echo "::warning::no installer artifacts were downloaded from this run"
+          fi
+          mapfile -t FILES < <(find "$RUNNER_TEMP/installers" -type f 2>/dev/null)
+          if [ "${#FILES[@]}" -gt 0 ]; then
+            gh release upload "$TAG" "${FILES[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+          fi
+
+      - name: Generate and upload latest.json
+        id: generate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          node scripts/generate-latest-json.js \
+            --repo "$GITHUB_REPOSITORY" \
+            --tag "$TAG" \
+            --version "$VERSION"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+          MISSING: ${{ steps.generate.outputs.missing_platforms }}
+        run: |
+          # MicroBenchmark-Releases holds artifacts only, no commit history --
+          # gh's --generate-notes needs commits to diff, so it doesn't apply
+          # here. Point at the real repo's tag for anyone wanting the actual
+          # changelog.
+          NOTES="Built from https://github.com/AISmithLab/MicroBenchmark/tree/$TAG."
+          if [ -n "$MISSING" ]; then
+            NOTES="$NOTES"$'\n\n'"⚠️ Missing platform build(s): $MISSING -- re-run the release workflow (or re-run only the failed job) to add them."
+          fi
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --notes "$NOTES"
