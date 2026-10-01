@@ -304,13 +304,14 @@ jobs:
       - name: Prepare App Store Connect API key
         if: matrix.platform_key == 'darwin-aarch64'
         env:
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_KEY_PRIVATE_KEY_BASE64: ${{ secrets.APPLE_API_KEY_PRIVATE_KEY_BASE64 }}
         shell: bash
         run: |
           set -euo pipefail
-          if [ -z "${APPLE_API_KEY:-}" ] || [ -z "${APPLE_API_KEY_PRIVATE_KEY_BASE64:-}" ]; then
-            echo "::error::missing App Store Connect API key secrets: APPLE_API_KEY, APPLE_API_KEY_PRIVATE_KEY_BASE64"
+          if [ -z "${APPLE_API_ISSUER:-}" ] || [ -z "${APPLE_API_KEY:-}" ] || [ -z "${APPLE_API_KEY_PRIVATE_KEY_BASE64:-}" ]; then
+            echo "::error::missing App Store Connect API key secrets: APPLE_API_ISSUER, APPLE_API_KEY, APPLE_API_KEY_PRIVATE_KEY_BASE64"
             exit 1
           fi
           API_KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
@@ -358,6 +359,77 @@ jobs:
           if [ -n "${APPLE_KEYCHAIN_PATH:-}" ] && [ -e "$APPLE_KEYCHAIN_PATH" ]; then
             security delete-keychain "$APPLE_KEYCHAIN_PATH"
           fi
+
+      # tauri build notarizes and staples the .app (the updater's .app.tar.gz
+      # needs that stapled copy) but only signs the .dmg around it, so
+      # Gatekeeper saw the download itself as unnotarized. This is a second
+      # trip through Apple's notary queue, for the DMG.
+      #
+      # Not run through quiet, so a rejection can be read from the public log.
+      # It prints only notarytool's submission id and status and, on
+      # rejection, Apple's status summary and issues -- never source, and not
+      # the full log's ticketContents list of every file in the bundle.
+      - name: Notarize and staple macOS DMG
+        if: matrix.platform_key == 'darwin-aarch64'
+        env:
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          DMG_DIR="apps/desktop/src-tauri/target/release/bundle/dmg"
+          DMG=$(find "$DMG_DIR" -name '*.dmg' 2>/dev/null | head -1 || true)
+          if [ -z "$DMG" ]; then
+            echo "::error::no .dmg to notarize under $DMG_DIR"
+            exit 1
+          fi
+          AUTH=(--key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER")
+          RESULT="$RUNNER_TEMP/notarize-dmg.json"
+          xcrun notarytool submit "$DMG" "${AUTH[@]}" \
+            --wait --timeout 60m --output-format json > "$RESULT" || true
+          # The JSON result is the last line that is a JSON object; anything
+          # else notarytool printed is shown but not parsed.
+          read -r SUBMISSION STATUS < <(python3 -c '
+          import json, sys
+          result = {}
+          for line in open(sys.argv[1]):
+              print(line, end="", file=sys.stderr)
+              if line.lstrip().startswith("{"):
+                  try:
+                      result = json.loads(line)
+                  except ValueError:
+                      pass
+          print(result.get("id") or "-", (result.get("status") or "unknown").replace(" ", "_"))
+          ' "$RESULT")
+          if [ "$STATUS" = "In_Progress" ]; then
+            echo "::error::Apple did not finish notarizing the DMG within 60 minutes (submission $SUBMISSION). Check it with 'xcrun notarytool info $SUBMISSION', then rerun the failed jobs."
+            exit 1
+          fi
+          if [ "$STATUS" != "Accepted" ]; then
+            echo "::error::DMG notarization ended with status '$STATUS' (submission $SUBMISSION)"
+            if [ "$SUBMISSION" != "-" ]; then
+              xcrun notarytool log "$SUBMISSION" "${AUTH[@]}" "$RUNNER_TEMP/notarize-dmg-log.json" \
+                && python3 -c '
+          import json, sys
+          log = json.load(open(sys.argv[1]))
+          print(json.dumps({k: log.get(k) for k in ("status", "statusSummary", "issues")}, indent=2))
+          ' "$RUNNER_TEMP/notarize-dmg-log.json" || true
+            fi
+            exit 1
+          fi
+          # The ticket can take a moment to reach Apple's CDN after acceptance.
+          for attempt in 1 2 3 4 5; do
+            if xcrun stapler staple "$DMG"; then
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "::error::could not staple the notarization ticket to the DMG"
+              exit 1
+            fi
+            sleep 30
+          done
+          xcrun stapler validate "$DMG"
+          spctl -a -t open --context context:primary-signature -v "$DMG"
 
       - name: Collect macOS installers
         if: matrix.platform_key == 'darwin-aarch64'
